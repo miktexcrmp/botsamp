@@ -159,34 +159,137 @@ async def process_instruction(message: types.Message, state: FSMContext):
     stdout, stderr = await process.communicate()
     output_log = stdout.decode('cp1251', errors='ignore') + stderr.decode('cp1251', errors='ignore')
 
-    # 4. Отправка результатов
-    if os.path.exists(amx_path):
-        # Успех
-        input_pwn = FSInputFile(file_path, filename=f"FIXED_{original_name}")
-        input_amx = FSInputFile(amx_path, filename=f"FIXED_{original_name.replace('.pwn', '.amx')}")
+import asyncio
+import os
+import logging
+import time
+from threading import Thread
+from flask import Flask
+from aiogram import Bot, Dispatcher, types, F
+from aiogram.filters import Command, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import FSInputFile
+from openai import AsyncOpenAI
 
-        await message.answer_document(input_pwn, caption="Исходный код (исправленный)")
-        await message.answer_document(input_amx, caption="Скомпилированный мод (.amx)")
-        await message.answer("Готово. Ошибок не обнаружено.")
-    else:
-        # Провал
-        # Если лог слишком длинный, режем его
-        if len(output_log) > 3500:
-            output_log = output_log[:3500] + "\n... (лог обрезан)"
-            
-        await message.answer(f"Компиляция не удалась. Ошибки:\n{output_log}")
-        input_pwn = FSInputFile(file_path, filename=f"FAILED_{original_name}")
-        await message.answer_document(input_pwn, caption="Попытка исправления (код с ошибками)")
+# --- КОНФИГУРАЦИЯ ---
+BOT_TOKEN = "8383278594:AAG-AXod5yB7OKzYQpJBdCzo-csvTH12gA0"
+OPENAI_API_KEY = "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"
 
-    # Сбрасываем состояние
+# Пути для Linux (Koyeb)
+COMPILER_PATH = "./compiler/pawncc" 
+INCLUDE_PATH = "./includes"
+TEMP_FOLDER = "temp"
+
+# --- FLASK ДЛЯ KOYEB (ЧТОБЫ НЕ ПАДАЛ) ---
+app = Flask(__name__)
+@app.route('/')
+def health(): return "AI_PAWN_DEV_ACTIVE", 200
+
+def run_web():
+    port = int(os.environ.get("PORT", 8080))
+    app.run(host='0.0.0.0', port=port)
+
+# Настройка ИИ
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+logging.basicConfig(level=logging.INFO)
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+class ModWork(StatesGroup):
+    waiting_for_file = State()
+    waiting_for_instruction = State()
+
+# --- ХЕНДЛЕРЫ ---
+
+@dp.message(Command("start"))
+async def cmd_start(message: types.Message, state: FSMContext):
+    await state.clear()
+    await message.answer("Привет! Я ИИ-разработчик SAMP.\nПришли файл .pwn или .txt с кодом.")
+    await state.set_state(ModWork.waiting_for_file)
+
+@dp.message(StateFilter(ModWork.waiting_for_file), F.document)
+async def process_file(message: types.Message, state: FSMContext):
+    file_name = message.document.file_name
+    if not (file_name.endswith('.pwn') or file_name.endswith('.txt')):
+        return await message.answer("Ошибка: Нужен файл .pwn или .txt")
+
+    file = await bot.get_file(message.document.file_id)
+    local_path = os.path.join(TEMP_FOLDER, f"{message.from_user.id}_{file_name}")
+    
+    await bot.download_file(file.file_path, local_path)
+    await state.update_data(file_path=local_path, original_name=file_name)
+    
+    await message.answer("Файл получен. Теперь напиши, что нужно исправить или добавить.")
+    await state.set_state(ModWork.waiting_for_instruction)
+
+@dp.message(StateFilter(ModWork.waiting_for_instruction), F.text)
+async def process_instruction(message: types.Message, state: FSMContext):
+    data = await state.get_data()
+    file_path = data['file_path']
+    original_name = data['original_name']
+    instruction = message.text
+
+    status_msg = await message.answer("🤖 ИИ анализирует и правит код...")
+
+    try:
+        with open(file_path, 'r', encoding='cp1251', errors='ignore') as f:
+            code = f.read()
+
+        # Ограничение контекста для стабильности
+        code_context = code[:35000] if len(code) > 35000 else code
+
+        response = await client.chat.completions.create(
+            model="gpt-4o-mini", # Можно сменить на gpt-4o
+            messages=[
+                {"role": "system", "content": "Ты мастер Pawn SAMP. Верни ТОЛЬКО исправленный код. Без markdown (```)."},
+                {"role": "user", "content": f"Инструкция: {instruction}\n\nКод:\n{code_context}"}
+            ]
+        )
+        
+        new_code = response.choices[0].message.content.replace("```pawn", "").replace("```", "")
+
+        with open(file_path, 'w', encoding='cp1251') as f:
+            f.write(new_code)
+
+        await status_msg.edit_text("✅ Код обновлен. Компилирую...")
+
+        amx_path = file_path.replace(".pwn", ".amx").replace(".txt", ".amx")
+        
+        # Даем права компилятору
+        os.system(f"chmod +x {COMPILER_PATH}")
+        
+        process = await asyncio.create_subprocess_exec(
+            COMPILER_PATH, file_path, f"-o{amx_path}", f"-i{INCLUDE_PATH}", "-;+", "-(+",
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+        )
+        
+        stdout, stderr = await process.communicate()
+        output_log = (stdout + stderr).decode('cp1251', errors='ignore')
+
+        if os.path.exists(amx_path):
+            await message.answer_document(FSInputFile(file_path, filename=f"FIXED_{original_name}"), caption="Исправленный код")
+            await message.answer_document(FSInputFile(amx_path, filename=f"FIXED_{original_name.replace('.pwn', '.amx')}"), caption="Скомпилированный .AMX")
+        else:
+            await message.answer_document(FSInputFile(file_path), caption=f"Ошибка компиляции:\n{output_log[:1000]}")
+
+    except Exception as e:
+        await message.answer(f"Ошибка: {e}")
+    
     await state.clear()
 
-# Запуск
+# --- ЗАПУСК ---
 async def main():
-    if not os.path.exists(TEMP_FOLDER):
-        os.makedirs(TEMP_FOLDER)
+    if not os.path.exists(TEMP_FOLDER): os.makedirs(TEMP_FOLDER)
+    if not os.path.exists("compiler"): os.makedirs("compiler")
+    if not os.path.exists("includes"): os.makedirs("includes")
+    
+    # Запуск Flask в отдельном потоке
+    Thread(target=run_web, daemon=True).start()
+    
+    await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 
 if __name__ == "__main__":
     asyncio.run(main())
-      
